@@ -1,0 +1,144 @@
+plugins {
+  id 'com.android.application'
+  id 'com.google.gms.google-services'
+  id 'dev.flutter.flutter-gradle-plugin'
+}
+
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file('local.properties')
+if (localPropertiesFile.exists()) {
+  localPropertiesFile.withReader('UTF-8') { reader ->
+    localProperties.load(reader)
+  }
+}
+
+// Written to local.properties by the Flutter tool. They mirror pubspec.yaml
+// unless --build-name / --build-number are passed, which is how CI stamps a
+// release version onto the build. Null when Gradle is invoked directly, in
+// which case the pubspec values below are used.
+def flutterVersionCode = localProperties.getProperty('flutter.versionCode')
+def flutterVersionName = localProperties.getProperty('flutter.versionName')
+
+android {
+  namespace 'com.oxchat.nostr'
+  buildFeatures {
+    buildConfig true
+  }
+  compileSdk 36
+  buildToolsVersion "35.0.0"
+  ndkVersion "27.0.12077973"
+
+  // Add support for 16KB page sizes
+  packagingOptions {
+    jniLibs {
+      useLegacyPackaging true
+    }
+  }
+
+  //disable resource file check
+  def version = parsePubspecVersion()
+  def versionParts = version.split("\\+")
+  def resolvedVersionCode = (flutterVersionCode ?: versionParts[1]) as Integer
+  def resolvedVersionName = flutterVersionName ?: versionParts[0]
+  defaultConfig {
+    applicationId "com.oxchat.nostr"
+    minSdk 28
+    targetSdk 36
+    multiDexEnabled true
+    versionCode resolvedVersionCode
+    versionName resolvedVersionName
+
+    // Support for 16KB page sizes
+    externalNativeBuild {
+      cmake {
+        arguments "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
+      }
+    }
+  }
+
+  // isar_flutter_libs 3.1.0+1 ships a libisar.so that is not 16 KB-page
+  // aligned, which Google Play rejects. src/main/jniLibs holds a rebuild of
+  // the same isar core (see ../LIBISAR.md); pick it over the plugin's copy.
+  packaging {
+    jniLibs {
+      pickFirsts += ['lib/arm64-v8a/libisar.so', 'lib/x86_64/libisar.so']
+    }
+  }
+
+  splits {
+    abi {
+      enable false  // Temporarily disable to fix packaging issue
+      reset()
+      include 'armeabi-v7a', 'arm64-v8a'
+      universalApk true
+    }
+  }
+
+  // Optional release signing when android/key.properties exists (e.g. in CI)
+  def keystorePropertiesFile = rootProject.file("key.properties")
+  if (keystorePropertiesFile.exists()) {
+    def keystoreProperties = new Properties()
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+    signingConfigs {
+      release {
+        keyAlias keystoreProperties['keyAlias']
+        keyPassword keystoreProperties['keyPassword']
+        storeFile rootProject.file(keystoreProperties['storeFile'])
+        storePassword keystoreProperties['storePassword']
+      }
+    }
+  }
+
+  buildTypes {
+    release {
+      minifyEnabled true
+      shrinkResources true
+      proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+      if (keystorePropertiesFile.exists()) {
+        signingConfig signingConfigs.release
+      }
+    }
+    debug {
+      minifyEnabled false
+      shrinkResources false
+      proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+    }
+  }
+
+  compileOptions {
+    coreLibraryDesugaringEnabled true
+    sourceCompatibility JavaVersion.VERSION_21
+    targetCompatibility JavaVersion.VERSION_21
+  }
+  lint {
+    abortOnError false
+    checkReleaseBuilds false
+  }
+}
+
+flutter {
+  source '../..'
+}
+
+dependencies {
+  implementation fileTree(include: ['*.jar'], dir: 'libs')
+  implementation 'androidx.appcompat:appcompat:1.2.0'
+  implementation 'androidx.multidex:multidex:2.0.1'
+  implementation platform('com.google.firebase:firebase-bom:32.0.0')
+  coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.3'
+}
+
+def parsePubspecVersion() {
+  def pubspec = file('../../pubspec.yaml')
+  def version = '1.0.0+1' // Default value
+
+  if (pubspec.exists()) {
+    def contents = pubspec.readLines()
+    def versionLine = contents.find { it.startsWith('version:') }
+    if (versionLine != null) {
+      version = versionLine.split(' ')[1].trim()
+    }
+  }
+
+  return version
+}

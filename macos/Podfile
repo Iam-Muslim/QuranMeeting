@@ -1,0 +1,79 @@
+platform :osx, '12.0'
+
+# CocoaPods analytics sends network stats synchronously affecting flutter build latency.
+ENV['COCOAPODS_DISABLE_STATS'] = 'true'
+
+project 'Runner', {
+  'Debug' => :debug,
+  'Profile' => :release,
+  'Release' => :release,
+}
+
+def flutter_root
+  generated_xcode_build_settings_path = File.expand_path(File.join('..', 'Flutter', 'ephemeral', 'Flutter-Generated.xcconfig'), __FILE__)
+  unless File.exist?(generated_xcode_build_settings_path)
+    raise "#{generated_xcode_build_settings_path} must exist. If you're running pod install manually, make sure \"flutter pub get\" is executed first"
+  end
+
+  File.foreach(generated_xcode_build_settings_path) do |line|
+    matches = line.match(/FLUTTER_ROOT\=(.*)/)
+    return matches[1].strip if matches
+  end
+  raise "FLUTTER_ROOT not found in #{generated_xcode_build_settings_path}. Try deleting Flutter-Generated.xcconfig, then run \"flutter pub get\""
+end
+
+require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
+
+flutter_macos_podfile_setup
+
+target 'Runner' do
+  use_frameworks!
+  use_modular_headers!
+
+  flutter_install_all_macos_pods File.dirname(File.realpath(__FILE__))
+  target 'RunnerTests' do
+    inherit! :search_paths
+  end
+end
+
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    flutter_additional_macos_build_settings(target)
+
+    # Some pods declare an older deployment target than the platform above
+    # (flutter_inappwebview_macos ships 10.14). Newer Swift compilers turn the
+    # resulting availability mismatch into a hard error, and current Xcode
+    # rejects anything below 12.0 outright, so align every pod with the platform
+    # declared above. The Runner itself targets 12.4+, so this drops nothing.
+    target.build_configurations.each do |config|
+      config.build_settings['MACOSX_DEPLOYMENT_TARGET'] = '12.0'
+
+      # libtor.a (the Rust static library built for the `tor` package)
+      # references liblzma symbols, but neither the pod nor the crate declares
+      # that dependency, so linking fails with undefined _lzma_* symbols for
+      # arm64. macOS ships liblzma in the SDK, so link it explicitly.
+      ldflags = config.build_settings['OTHER_LDFLAGS'] || ['$(inherited)']
+      ldflags = [ldflags] unless ldflags.is_a?(Array)
+      ldflags << '-llzma' unless ldflags.include?('-llzma')
+      config.build_settings['OTHER_LDFLAGS'] = ldflags
+    end
+  end
+  
+# Bitcode stripping configuration
+  bitcode_strip_path = `xcrun --find bitcode_strip`.chomp
+  def strip_bitcode_from_framework(bitcode_strip_path, framework_path)
+    command = "#{bitcode_strip_path} #{framework_path} -r -o #{framework_path}"
+    puts "Stripping bitcode: #{command}"
+    system(command)
+  end
+
+  framework_paths = [
+  ]
+
+  framework_paths.each do |framework_path|
+    strip_bitcode_from_framework(bitcode_strip_path, framework_path)
+  end
+end
+
+
+

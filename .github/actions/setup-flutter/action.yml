@@ -1,0 +1,120 @@
+name: Setup Flutter
+description: >-
+  Install the pinned Flutter SDK, resolve pub dependencies and expose the
+  version from pubspec.yaml.
+
+inputs:
+  flutter-version:
+    description: Flutter SDK version to install (must match README / Dockerfile).
+    required: false
+    default: '3.38.10'
+
+outputs:
+  version:
+    description: Full version from pubspec.yaml, e.g. 1.3.5+69.
+    value: ${{ steps.pubspec.outputs.version }}
+  version_name:
+    description: Version name from pubspec.yaml, e.g. 1.5.5.
+    value: ${{ steps.pubspec.outputs.version_name }}
+  version_code:
+    description: Build number from pubspec.yaml, used as the Android versionCode.
+    value: ${{ steps.pubspec.outputs.version_code }}
+
+runs:
+  using: composite
+  steps:
+    # The url_launcher_linux override pulls all of flutter/packages, whose
+    # deepest paths (google_maps_flutter, pigeon) exceed the 260-character
+    # limit, so `flutter pub get` dies with "Filename too long" on Windows.
+    # The override cannot be scoped to Linux - pub applies dependency_overrides
+    # on every platform - so widen the limit instead.
+    - name: Enable long paths
+      if: runner.os == 'Windows'
+      shell: bash
+      run: git config --global core.longpaths true
+
+    # The `tor` dependency builds its native library through cargokit, on every
+    # platform. cargokit installs the toolchain and targets it needs by itself,
+    # but only if rustup is already on PATH. All current GitHub runner images
+    # ship it; this is the fallback, mirroring the repo Dockerfile.
+    - name: Ensure Rust toolchain
+      shell: bash
+      run: |
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+        fi
+        rustup --version
+        cargo --version
+
+    # Pin the pub cache to one path on every runner. Windows would otherwise
+    # put it under %LOCALAPPDATA%, which the cache step below cannot express
+    # with a single path.
+    #
+    # The path has to be written in the form the *consumer* understands, not
+    # the form bash uses. Every later step runs Dart/Flutter as a native
+    # Windows process, but $HOME under Git Bash is POSIX (/c/Users/runneradmin),
+    # and pub cannot resolve that - it fails looking for its git cache at
+    # "c/Users/runneradmin/.pub-cache/git/cache/..." and reports the first git
+    # dependency as missing. Convert to a native path on Windows.
+    - name: Pin the pub cache location
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" = Windows ]; then
+          echo "PUB_CACHE=$(cygpath -w "$HOME")\\.pub-cache" >> "$GITHUB_ENV"
+        else
+          echo "PUB_CACHE=$HOME/.pub-cache" >> "$GITHUB_ENV"
+        fi
+
+    - name: Install Flutter ${{ inputs.flutter-version }}
+      uses: subosito/flutter-action@v2
+      with:
+        flutter-version: ${{ inputs.flutter-version }}
+        channel: stable
+        cache: true
+
+    # flutter-action caches the pub directory too, but its restore key never
+    # matched: three consecutive runs all logged "Cache not found" for
+    # flutter-pub-*, so every build re-fetched everything - including the
+    # ~100 MB flutter_webrtc fork clone the override pulls in. Cache it here
+    # with a key that is stable across runs, and a restore-keys prefix so a
+    # changed pubspec still starts from the last cache rather than nothing.
+    - name: Cache pub dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.pub-cache
+        key: pub-v2-${{ runner.os }}-${{ inputs.flutter-version }}-${{ hashFiles('**/pubspec.yaml') }}
+        restore-keys: |
+          pub-v2-${{ runner.os }}-${{ inputs.flutter-version }}-
+          pub-v2-${{ runner.os }}-
+
+    - name: Resolve dependencies
+      shell: bash
+      run: flutter pub get
+
+    - name: Resolve build version
+      id: pubspec
+      shell: bash
+      run: |
+        pubspec_version=$(awk '/^version:/ {print $2; exit}' pubspec.yaml)
+        version_name="${pubspec_version%%+*}"
+        version_code="${pubspec_version##*+}"
+
+        # pubspec.yaml is the single source of truth for the version, because
+        # its build number becomes the Android versionCode and Play refuses a
+        # versionCode that does not increase. On a tag build, make sure the tag
+        # agrees with it rather than silently shipping a mismatch.
+        if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${tag_version%%-release*}"
+          if [ "$tag_version" != "$version_name" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME says $tag_version but pubspec.yaml says $version_name. Bump pubspec.yaml (version AND build number) before tagging."
+            exit 1
+          fi
+        fi
+
+        echo "version=$pubspec_version" >> "$GITHUB_OUTPUT"
+        echo "version_name=$version_name" >> "$GITHUB_OUTPUT"
+        echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
+        echo "Building 0xchat $version_name (versionCode $version_code)"

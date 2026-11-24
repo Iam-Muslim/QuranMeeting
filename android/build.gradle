@@ -1,0 +1,76 @@
+
+allprojects {
+    repositories {
+        gradlePluginPortal()
+        google()
+        mavenCentral()
+        maven { url "https://plugins.gradle.org/m2/" }
+        maven { url "https://maven.mozilla.org/maven2/" }
+        jcenter()
+    }
+
+    tasks.withType(JavaCompile) {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile) {
+        kotlinOptions {
+            jvmTarget = "17"
+        }
+    }
+}
+
+rootProject.buildDir = '../build'
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+    afterEvaluate {
+        if (it.hasProperty('android')) {
+            if (it.android.namespace == null) {
+                def manifest = new XmlSlurper().parse(file(it.android.sourceSets.main.manifest.srcFile))
+                def packageName = manifest.@package.text()
+                android.namespace = packageName
+            }
+            def javaVersion = JavaVersion.VERSION_17
+            android {
+                // Google Play requires targetSdk 36 for updates (it refused
+                // 1.5.6+110 at 35); sqflite_android 2.4.2+ also needs
+                // compileSdk 36.
+                compileSdkVersion 36
+                defaultConfig {
+                    targetSdkVersion 36
+                }
+                // Google Play requires 16 KB-page-aligned native libraries.
+                // Plugins that compile theirs with CMake (rive_common's
+                // librive_text) only get that when asked; the app-level
+                // argument in app/build.gradle does not reach them.
+                if (externalNativeBuild.cmake.path != null) {
+                    defaultConfig.externalNativeBuild.cmake.arguments "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
+                }
+                compileOptions {
+                    sourceCompatibility javaVersion
+                    targetCompatibility javaVersion
+                }
+                tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+                    kotlinOptions {
+                        jvmTarget = javaVersion.toString()
+                    }
+                }
+            }
+        }
+        configurations.all {
+            resolutionStrategy {
+                force "com.google.crypto.tink:tink:1.13.0"
+                exclude group: "com.google.crypto.tink", module: "tink-android"
+            }
+        }
+
+    }
+}
+subprojects {
+    project.evaluationDependsOn(':app')
+}
+
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+}

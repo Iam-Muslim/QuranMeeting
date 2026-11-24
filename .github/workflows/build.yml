@@ -1,0 +1,467 @@
+# Packages 0xchat for Android and the desktop platforms.
+#
+# Triggers
+#   - Manually (Actions -> Build & Package -> Run workflow), optionally for a
+#     single platform.
+#   - Automatically on a `v*` tag, which builds every platform, uploads the
+#     bundle to Play, fetches back the APK Play signed with the app signing
+#     key, and attaches everything installable to a draft GitHub Release,
+#     together with a SHA256SUMS manifest covering them all. The same sums are
+#     repeated in the release description, so they can be read without
+#     downloading anything; `sha256sum -c SHA256SUMS` verifies a directory of
+#     downloads in one go.
+#
+# Optional secrets (Android release signing). android/app/build.gradle attaches
+# no signingConfig to the release build type unless android/key.properties
+# exists, so WITHOUT these secrets the APK comes out completely unsigned and
+# cannot be installed on a device (verified locally with apksigner):
+#   ANDROID_KEYSTORE_BASE64  - `base64 -i my-release-key.jks` output
+#   ANDROID_KEYSTORE_PASSWORD
+#   ANDROID_KEY_ALIAS
+#   ANDROID_KEY_PASSWORD
+#
+# PLAY_SERVICE_ACCOUNT_JSON is required for a tag build: the release ships the
+# APK Play signed, so a tag without this secret fails rather than publishing an
+# APK carrying the upload key, which Android cannot install over a Play
+# install. A manual run does not need it unless Play publishing is asked for.
+#
+# Tagging consumes an Android version code permanently and leaves a draft on
+# Play's internal track. Both that and the GitHub release are drafts: nothing
+# reaches a user until someone promotes them by hand.
+#
+# The version comes from pubspec.yaml and a tag that disagrees with it fails
+# the build, so bump `version:` - name AND build number - before tagging.
+#
+# macOS artifacts are ad-hoc signed only (the Xcode project uses
+# CODE_SIGN_IDENTITY = "-"). Distributing outside of a "right click -> Open"
+# flow additionally needs a Developer ID certificate and notarisation.
+#
+# The Windows job emits both a portable zip and an Inno Setup installer built
+# from windows/packaging/oxchat.iss. The installer is unsigned, so SmartScreen
+# will warn on first run until an Authenticode certificate is wired in.
+
+name: Build & Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to build
+        type: choice
+        default: all
+        options:
+          - all
+          - android
+          - linux
+          - windows
+          - macos
+      publish_to_play:
+        description: >-
+          Upload the bundle to Play. Off by default: it consumes the version
+          code permanently and creates a draft release.
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    name: Android (APK + AAB)
+    if: github.ref_type == 'tag' || inputs.platform == 'all' || inputs.platform == 'android'
+    runs-on: ubuntu-22.04
+    env:
+      KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # android/app/build.gradle compiles against Java 21.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # Gradle downloads its dependencies and recompiles everything from cold
+      # on each run: bundleRelease measured 1399-1737s across three runs, while
+      # a warm local rebuild of the same target takes about a minute. Keyed on
+      # the build files so a dependency change invalidates it, with a prefix
+      # fallback so an unrelated edit still starts warm.
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # cargokit (used by the `tor` dependency) builds the native library with
+      # the exact NDK named by android.ndkVersion in android/app/build.gradle.
+      - name: Install Android NDK
+        run: |
+          sdk="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdk" --licenses > /dev/null 2>&1 || true
+          "$sdk" --install "ndk;27.0.12077973"
+
+      - id: setup
+        uses: ./.github/actions/setup-flutter
+
+      # android/app/build.gradle picks up android/key.properties when present.
+      - name: Configure release signing
+        if: env.KEYSTORE_BASE64 != ''
+        env:
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/release-keystore.jks
+          {
+            echo "storeFile=app/release-keystore.jks"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > android/key.properties
+
+      - name: Warn when unsigned
+        if: env.KEYSTORE_BASE64 == ''
+        run: echo "::warning::No ANDROID_KEYSTORE_BASE64 secret - artifacts will be UNSIGNED and cannot be installed."
+
+      # Version comes from pubspec.yaml, which the setup action has already
+      # checked against the tag. Its build number is the Android versionCode,
+      # and Play rejects a versionCode that does not increase, so it has to be
+      # bumped by hand for every release.
+      # Skipped for a release: the installable APK comes from Play, signed with
+      # the app signing key, and one built here would carry the upload key
+      # instead. Android refuses to install across that difference, so shipping
+      # both would strand whoever picked the wrong one. Still built for a manual
+      # run, where no Play-signed APK is produced.
+      - name: Build APK
+        if: github.ref_type != 'tag'
+        run: flutter build apk --release
+
+      - name: Build App Bundle
+        run: flutter build appbundle --release
+
+      # Google Play rejects 64-bit native libraries that are not 16 KB-page
+      # aligned, and only says so when a release is committed. Catch it here.
+      - name: Check 16 KB page alignment
+        run: python3 .github/scripts/check_16kb_pages.py build/app/outputs/bundle/release/app-release.aab
+
+      # cargokit builds the Rust library of the `tor` plugin and, when it does
+      # not recognise Flutter's Gradle plugin, skips itself with one log line
+      # while the build still passes. Play 111 shipped that way, without Tor.
+      - name: Check Rust libraries are bundled
+        run: python3 .github/scripts/check_native_libs.py build/app/outputs/bundle/release/app-release.aab libtor.so
+
+      - name: Rename outputs
+        run: |
+          v="${{ steps.setup.outputs.version_name }}"
+          suffix=""
+          [ -z "$KEYSTORE_BASE64" ] && suffix="-unsigned"
+          mkdir -p dist
+          apk=build/app/outputs/flutter-apk/app-release.apk
+          [ -f "$apk" ] && mv "$apk" "dist/oxchat-$v-android$suffix.apk"
+          mv build/app/outputs/bundle/release/app-release.aab "dist/oxchat-$v-android$suffix.aab"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux (x64)
+    if: github.ref_type == 'tag' || inputs.platform == 'all' || inputs.platform == 'linux'
+    # 22.04 keeps the glibc requirement low for the produced bundle.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/linux-build-deps
+
+      - id: setup
+        uses: ./.github/actions/setup-flutter
+
+      - name: Build
+        run: flutter build linux --release
+
+      - name: Package
+        run: |
+          v="${{ steps.setup.outputs.version_name }}"
+          mkdir -p dist
+          tar -czf "dist/oxchat-$v-linux-x64.tar.gz" -C build/linux/x64/release/bundle .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows (installer + zip)
+    if: github.ref_type == 'tag' || inputs.platform == 'all' || inputs.platform == 'windows'
+    # Pinned, not windows-latest: that label now resolves to the
+    # windows-2025-vs2026 image, and flutter_tools 3.29.3 maps only Visual
+    # Studio major 17 to a CMake generator, falling back to "Visual Studio 16
+    # 2019" for anything newer - a generator no current runner has.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: setup
+        uses: ./.github/actions/setup-flutter
+
+      - name: Build
+        run: flutter build windows --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = "${{ steps.setup.outputs.version_name }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath "dist/oxchat-$v-windows-x64.zip"
+
+      # The zip above is the portable download; this is the one that installs.
+      # Inno Setup 6 ships preinstalled on the windows runner images, so this
+      # needs no extra download - see windows/packaging/oxchat.iss for what the
+      # installer does.
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $v = "${{ steps.setup.outputs.version_name }}"
+          $root = (Get-Location).Path
+
+          # The images put ISCC.exe on PATH, but that is an image detail rather
+          # than a promise, so fall back to the install location.
+          $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) { throw "Inno Setup compiler not found - looked on PATH and at $iscc" }
+
+          & $iscc /Q `
+            "/DAppVersion=$v" `
+            "/DBuildDir=$root\build\windows\x64\runner\Release" `
+            "/DDistDir=$root\dist" `
+            "/DOutputName=oxchat-$v-windows-x64-setup" `
+            windows\packaging\oxchat.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+          # /Q silences ISCC, so confirm the artifact rather than trusting it.
+          $setup = "dist/oxchat-$v-windows-x64-setup.exe"
+          if (-not (Test-Path $setup)) { throw "$setup was not produced" }
+          "{0} ({1:N1} MB)" -f $setup, ((Get-Item $setup).Length / 1MB)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS (.app)
+    if: github.ref_type == 'tag' || inputs.platform == 'all' || inputs.platform == 'macos'
+    # macos-15, not macos-14: in_app_purchase_storekit 0.4.x (pulled in by
+    # in_app_purchase in ox_common) compiles StoreKit 2 win-back offer APIs -
+    # winBackOffers, eligibleWinBackOfferIDs, OfferType.winBack - that exist
+    # only in the macOS 15 SDK. On macos-14 (Xcode 15) SwiftCompile fails and
+    # the app never links.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: setup
+        uses: ./.github/actions/setup-flutter
+
+      # `flutter build macos` runs `pod install` itself.
+      - name: Build
+        run: flutter build macos --release
+
+      # The bundle is named after PRODUCT_NAME (0xchat.app), not the Flutter
+      # target, so resolve it rather than hardcoding the name.
+      - name: Package
+        run: |
+          v="${{ steps.setup.outputs.version_name }}"
+          app=$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' | head -1)
+          test -n "$app" || { echo "no .app produced"; exit 1; }
+          mkdir -p dist
+          ditto -c -k --keepParent "$app" "dist/oxchat-$v-macos.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+          if-no-files-found: error
+
+  play:
+    name: Play (upload + fetch signed APK)
+    # A tag runs this, because the APK a release ships has to be the one Play
+    # signed with the app signing key. The cost is deliberate: tagging now
+    # consumes the version code permanently and leaves a draft on the internal
+    # track, which still has to be promoted by hand in the Play Console.
+    if: github.ref_type == 'tag' || inputs.publish_to_play
+    needs: android
+    runs-on: ubuntu-latest
+    env:
+      PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require the Play credential
+        if: env.PLAY_SERVICE_ACCOUNT_JSON == ''
+        run: |
+          echo "::error::PLAY_SERVICE_ACCOUNT_JSON is not set."
+          exit 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: android
+          path: dist
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install --quiet google-auth requests
+
+      - name: Read version from pubspec.yaml
+        id: v
+        run: |
+          full=$(awk '/^version:/ {print $2; exit}' pubspec.yaml)
+          echo "code=${full##*+}" >> "$GITHUB_OUTPUT"
+          echo "name=${full%%+*}" >> "$GITHUB_OUTPUT"
+
+      # Uploads, stages a draft release, then downloads the APK Play signed
+      # with the app signing key. That download is the only way to publish an
+      # APK elsewhere that can upgrade a Play install.
+      - name: Upload to Play and fetch the signed APK
+        run: |
+          aab=$(find dist -name '*.aab' | head -1)
+          test -n "$aab" || { echo "::error::no .aab in the android artifact"; exit 1; }
+          python .github/scripts/play_publish.py \
+            --aab "$aab" \
+            --version-code "${{ steps.v.outputs.code }}" \
+            --release-name "${{ steps.v.outputs.name }}" \
+            --track internal \
+            --commit \
+            --download \
+            --out-dir signed
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: play-signed-apk
+          path: signed/*
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: [android, linux, windows, macos, play]
+    # always(): the desktop jobs are skipped on a manual single-platform run.
+    # !failure() still stops the release when Play upload or any build fails.
+    if: always() && startsWith(github.ref, 'refs/tags/') && !failure() && !cancelled()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # The bundle is an input to Play, not something a user can install, and
+      # at 200 MB+ it would dominate the release page. The APK stays: it is the
+      # one Play signed, fetched back by the job above.
+      - name: Keep only what can be installed
+        run: |
+          rm -f dist/*.aab
+          apks=$(find dist -maxdepth 1 -name '*.apk' | wc -l)
+          if [ "$apks" -ne 1 ]; then
+            echo "::error::expected exactly one APK in the release, found $apks."
+            echo "Two APKs mean two signatures, and Android cannot install one over the other."
+            find dist -maxdepth 1 -name '*.apk'
+            exit 1
+          fi
+          ls -1 dist
+
+      # Hashing centrally, rather than in each platform job, keeps one
+      # implementation instead of three: the build runners disagree
+      # (sha256sum on Linux, shasum on macOS, Get-FileHash on Windows) while
+      # this job is ubuntu-latest and, after the download above, holds every
+      # artifact from every platform.
+      - name: Checksum the artifacts
+        run: |
+          cd dist
+
+          # `sha256sum -c SHA256SUMS` resolves the listed paths relative to the
+          # working directory, so the manifest has to name the files bare - and
+          # must exclude itself, since the redirection below creates it before
+          # find walks the directory.
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' \
+            | sort | xargs -r sha256sum > SHA256SUMS
+          test -s SHA256SUMS || { echo "::error::dist/ held no files to checksum"; exit 1; }
+          cat SHA256SUMS
+
+          # Issue #17 asked for the sums to be readable in the release
+          # description, not just downloadable. Emitting both from this one
+          # computation means the text and the attached manifest cannot drift.
+          # Written outside dist/ so `files:` below does not upload it as an
+          # asset of the release it describes.
+          {
+            echo '## Verify your download'
+            echo
+            echo 'Every asset below is listed in `SHA256SUMS`. Download it next to them and run:'
+            echo
+            echo '    sha256sum -c SHA256SUMS      # macOS: shasum -a 256 -c SHA256SUMS'
+            echo
+            echo 'Windows PowerShell has no `-c` equivalent; compare a single file with'
+            echo '`Get-FileHash -Algorithm SHA256 <file>`.'
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } > "$GITHUB_WORKSPACE/release-body.md"
+
+      # GitHub's generated changelog credits every entry "by @user" and adds a
+      # "New Contributors" list, but the release page should list the changes
+      # only. So instead of generate_release_notes, ask for the same notes
+      # here, drop the credits, and append them under the checksums.
+      - name: Changelog without contributor credits
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="$GITHUB_REF_NAME" --jq .body > generated-notes.md
+          echo >> "$GITHUB_WORKSPACE/release-body.md"
+          python3 - generated-notes.md >> "$GITHUB_WORKSPACE/release-body.md" <<'PY'
+          import re, sys
+
+          lines = open(sys.argv[1], encoding='utf-8').read().splitlines()
+          out, in_contributors = [], False
+          for line in lines:
+              if line.startswith('## New Contributors'):
+                  in_contributors = True
+                  continue
+              if in_contributors and (line.startswith('## ') or line.startswith('**Full Changelog**')):
+                  in_contributors = False
+              if in_contributors:
+                  continue
+              # "* Title by @user in https://github.com/o/r/pull/12" -> "* Title (#12)"
+              out.append(re.sub(r'^(\* .*?) by @\S+ in https://github\.com/\S+/pull/(\d+)\s*$',
+                                r'\1 (#\2)', line))
+          text = re.sub(r'\n{3,}', '\n\n', '\n'.join(out)).strip()
+          # A blank line keeps "Full Changelog" from rendering inside the last list item.
+          text = re.sub(r'\n+(\*\*Full Changelog\*\*)', r'\n\n\1', text)
+          print(text)
+          PY
+          cat "$GITHUB_WORKSPACE/release-body.md"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*
+          body_path: release-body.md
